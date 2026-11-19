@@ -1,0 +1,116 @@
+services:
+  db:
+    image: postgres
+    container_name: db
+    restart: on-failure
+    env_file:
+      - .env
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./volumes/pgdata:/var/lib/postgresql/data/pgdata
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:4.3.6-management
+    hostname: my-rabbit
+    restart: on-failure
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?задайте RABBITMQ_DEFAULT_USER в .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?задайте RABBITMQ_DEFAULT_PASS в .env}
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  migrate:
+    image: ton-transfer-service
+    build: .
+    env_file: [.env]
+    environment:
+      POSTGRES_HOST: db
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["poetry", "run", "alembic", "upgrade", "head"]
+
+  api:
+    image: ton-payment
+    build: .
+    restart: on-failure
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: db
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    command: ["poetry", "run", "uvicorn", "ton_payment.main_api:app", "--host", "0.0.0.0", "--port", "8080"]
+
+  outbox-worker:
+    image: ton-payment
+    build: .
+    restart: on-failure
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: db
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    stop_grace_period: 90s
+    command: ["poetry", "run", "python", "-m", "ton_payment.outbox_worker"]
+
+  tracker-worker:
+    image: ton-payment
+    build: .
+    restart: on-failure
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: db
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    command: ["poetry", "run", "python", "-m", "ton_payment.tracker_worker"]
+
+  broker-consumers:
+    image: ton-payment
+    build: .
+    restart: on-failure
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: db
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    command: ["poetry", "run", "faststream", "run", "ton_payment.main_broker:faststream_app"]
+
+
+volumes:
+  rabbitmq_data:
